@@ -1,0 +1,658 @@
+library(rvest)
+library(tidyr)
+library(selectr)
+library(tibble)
+library(stringr)
+library(dplyr)
+library(googledrive)
+library(rvest)
+library(XML)
+library(RCurl)
+library(lubridate)
+library(stringi)
+library(plyr)
+
+getwd()
+parole <- read.csv('parole3.csv')
+names(parole)
+parole$X <- NULL
+parole$X1 <- NULL
+parole$X1_1 <- NULL
+##Looking at website
+d <- read_html("https://www.ok.gov/ppb/Dockets_and_Results/index.html") %>%
+  html_nodes("a") %>%
+  html_attr("href") %>%
+  as.tibble() %>%
+  filter(str_detect(value, "January|February|March|April|May|June|July|August|September|October|November|December|Parole Docket")) %>%
+  filter(!str_detect(value, "Commutation|Pardon")) %>%
+  filter(str_detect(value, "Results|RESULTS"))
+
+d$value <- paste0("https://www.ok.gov", d$value)
+d$name <- str_extract(d$value, "(?<=documents/).*?(?=.pdf)") %>%
+  str_remove("Parole")  %>%
+  str_replace_all("%20", " ")
+d$name <- paste0(d$name, ".pdf") %>%
+  str_squish()
+d$value <- str_replace_all(d$value, " ", "%20")
+
+d$year <- ifelse(is.na(str_extract(d$name, "\\d{4}")), 
+                 2016, 
+                 str_extract(d$name, "\\d{4,6}") %>% as.numeric)
+d$month <- str_extract(d$name %>% str_to_upper, "(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)")
+d$month <- ifelse(is.na(d$month), 'SEP', d$month)
+d$docket_month <- mdy(paste(d$month, 1, d$year))
+
+
+
+##Finding new pdfs
+old_pdfs <- list.files("pdfs/results")
+all_pdfs <- d$name
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+new_pdfs <- all_pdfs[all_pdfs %!in% old_pdfs]
+new_pdfs_url <- d$value[which(d$name == new_pdfs)]
+
+
+##Downloading new pdfs
+setwd("/Docket and Results PDFs")
+for (i in 1:length(new_pdfs_url)) {
+  download.file(new_pdfs_url[i], destfile = paste0(new_pdfs[i]))
+}
+
+new_pdfs
+##Cleaning new pdf
+names(parole)
+
+docket <- pdftools::pdf_text(new_pdfs) %>%
+  as.data.frame() %>%
+  mutate(month = as.character(d$docket_month[which(d$name == new_pdfs)]))
+
+
+names(docket)[names(docket) == "."] <- "info"
+
+##Separating rows
+names <- str_extract_all(docket$info, "(?<=\n|^).*?(?=Docket Month)") %>%
+  unlist() %>%
+  str_squish()
+separated_rows <- separate_rows(docket, info, sep = "\n.*?(?=Docket Month)")
+docket <- data.frame(info = separated_rows)
+
+names(docket)[names(docket) == "info.info"] <- "info"
+names(docket)[names(docket) == "info.month"] <- "month"
+
+docket$info <- str_replace_all(docket$info, "\n", " new line ") %>% str_squish()
+
+##name
+docket$name <- names
+no_name <- which(docket$name == "")
+docket$name[no_name] <- str_extract(docket$info[no_name], "(?<=Docket Month: new line ).*(?= Personal)")
+
+##month
+docket$month <- ymd(docket$month)
+
+##personal_appearance
+docket$personal_appearance <- str_extract(docket$info, "(?<=Personal Appearance:).*?(?=new line)") %>%
+  str_squish() %>%
+  str_to_upper()
+
+##doc_num
+docket$doc_num <- str_extract(docket$info, "\\d{5,6}?(?= Type)")
+
+##type
+docket$type <- str_extract(docket$info, "(?<=Type: ).*?(?=new line)") %>% str_squish() %>% str_to_upper()
+docket$type <- ifelse(docket$type == "SER", 'SIR', docket$type)
+docket$type <- as.factor(docket$type)
+
+##county
+docket$county <- str_extract(docket$info, "(?<=OFFENSE).*?(?=County)") %>%
+  str_remove("Authority:.*?(?=$)") %>%
+  str_remove("#") %>%
+  str_remove_all('new line') %>%
+  str_squish() %>%
+  str_to_upper()
+
+##authority 
+docket$authority <- str_extract(docket$info, "(?<=Authority: ).*?(?=Count )") %>%
+  str_remove_all("new line") %>%
+  str_remove("Consideration: ") %>%
+  str_remove("Last Board") %>%
+  str_remove("County") %>%
+  str_to_upper() %>%
+  str_squish()
+
+docket$authority[which(str_detect(docket$authority, '1/3'))] <- '1/3'
+docket$authority[which(str_detect(docket$authority, 'Annual'))] <- 'ANNUAL'
+docket$authority[which(str_detect(docket$authority, '1/2|50%'))] <- '1/2'
+docket$authority[which(str_detect(docket$authority, '85%'))] <- '85%'
+docket$authority[which(str_detect(docket$authority, 'Discharge'))] <- 'PRIOR TO DISCHARGE'
+docket$authority[which(str_detect(docket$authority, 'Three Years'))] <- 'THREE YEARS'
+
+##last_consideration
+docket$last_consideration <- str_extract(docket$info, "(?<=CF: \\d{1,4}-\\d{1,4} ).*?(?=new line)") %>%
+  str_squish()
+
+docket$charge <- str_extract(docket$info, "(?<=Count \\d{1,2},).*?(?=new line Jail)") %>% 
+  str_remove_all('new line') %>%
+  str_remove('CF: \\d{1,4}-\\d{1,4}') %>%
+  str_remove('None') %>%
+  str_remove('\\d{2}/\\d{2}/\\d{4}') %>%
+  str_remove_all(',') %>%
+  str_remove('Denied|Stricken|Governor Denial|Waived|Removed|Parole to street|Pass \\d{1,2} days|Recommended|Stage II|Withdrawn') %>%
+  str_remove_all('#') %>%
+  str_remove_all('/') %>%
+  str_remove('AMENDED|AMENDED TO:|AMENDED TO ') %>%
+  str_squish() %>%
+  str_to_upper()
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'POSSESSION') & str_detect(charge, 'INTENT')), 'POSSESSION WITH INTENT TO DISTRIBUTE', 
+                  ifelse((str_detect(charge, 'BURGLARY|BURGLAY|BURGRLARY') & str_detect(charge, 'SECOND|2ND|2|II')), 'BURGLARY - SECOND DEGREE',
+                         ifelse(str_detect(charge, 'MANSLAUGHTER'), 'MANSLAUGHTER',
+                                ifelse(str_detect(charge, 'RAPE'), 'RAPE',
+                                       ifelse((str_detect(charge, 'CHILD') & str_detect(charge, 'ABUSE')), 'CHILD ABUSE',
+                                              ifelse(str_detect(charge, 'ACCESSORY'), 'ACCESSORY AFTER THE FACT',
+                                                     ifelse((str_detect(charge, 'ASSAULT') & str_detect(charge, 'BATTERY|BATTERU|BATTEY'))|str_detect(charge, 'DOMESTIC'), 'ASSAULT AND BATTERY',
+                                                            ifelse(str_detect(charge, 'ACTUAL PHYSICAL CONTROL'), 'ACTUAL PHYSICAL CONTROL',
+                                                                   ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTING|ATTEMPTED') & str_detect(charge, 'ELUDE|ELUDING')), 'ATTEMPTED ELUDING A POLICE OFFICER',
+                                                                          ifelse(str_detect(charge, 'DRIVING A MOTOR VEHICLE|DUI|UNDER INFLUENCE|UNDER THE INFLUENCE'), 'DUI', 
+                                                                                 ifelse(str_detect(charge, 'ELUDING|ELUDE'), 'ELUDING A POLICE OFFICER',    
+                                                                                        ifelse(str_detect(charge, 'MANUFACTURE|MANUFACTURING'), 'MANUFACTURE A CONTROLLED DRUG SUBSTANCE',
+                                                                                               charge)))))))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'MURDER') & str_detect(charge, '1ST|FIRST|1|I')), 'MURDER - FIRST DEGREE',
+                  ifelse((str_detect(charge, 'ARSON') & str_detect(charge, '2ND|SECOND|2|II')), 'ARSON - SECOND DEGREE',
+                         ifelse((str_detect(charge, 'ARSON') & str_detect(charge, '3RD|THIRD|3|III')), 'ARSON - THIRD DEGREE',
+                                ifelse(str_detect(charge, 'ROBBERY'), 'ROBBERY',
+                                       ifelse((str_detect(charge, 'ARSON') & str_detect(charge, '1ST|FIRST|1|I')), 'ARSON - FIRST DEGREE',
+                                              ifelse((str_detect(charge, 'ARSON') & str_detect(charge, '4TH|FOURTH|4|IV')), 'ARSON - FOURTH DEGREE',
+                                                     ifelse((str_detect(charge, 'ASSAULT') & str_detect(charge, 'WEAPON')), 'ASSAULT WITH A DEADLY WEAPON',
+                                                            ifelse((str_detect(charge, 'ASSAULT') & str_detect(charge, 'INTENT')), 'ASSAULT WITH INTENT TO COMMIT FELONY',
+                                                                   ifelse((str_detect(charge, 'ATTEMPT') & str_detect(charge, 'OBTAIN')), 'ATTEMPT TO OBTAIN CONTROLLED DRUG SUBSTANCE',
+                                                                          ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED') & str_detect(charge, 'BURGLARY|THEFT')), 'ATTEMPTED BURGLARY',
+                                                                                 ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED|ATTEMPTING') & str_detect(charge, 'ESCAPE|ESCAPING')), 'ATTEMPTED ESCAPE FROM PENAL INSTITUTION',
+                                                                                        charge))))))))))))
+
+docket <- docket %>%
+  mutate(charge =
+           ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED') & str_detect(charge, 'KIDNAPPING')), 'ATTEMPTED KIDNAPPING',
+                  ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED') & str_detect(charge, 'LARCENY')), 'ATTEMPTED LARCENY',
+                         ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED') & str_detect(charge, 'MURDER')), 'ATTEMPTED MURDER',
+                                ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED') & str_detect(charge, 'TRAFFICKING|TRAFFIC')), 'ATTEMPTED TRAFFICKING',
+                                       ifelse((str_detect(charge, 'ATTEMPT|ATTEMPTED|ATTEMPTING') & str_detect(charge, 'PREVENT')), 'ATTEMPTING TO PREVENT WITNESS FROM GIVING TESTIMONY',
+                                              ifelse(str_detect(charge, 'AUTO THEFT'), 'AUTO THEFT',
+                                                     ifelse((str_detect(charge, 'BRINGING|CARRYING|BRING|SMUGGLING') & str_detect(charge, 'IN|INTO')), 'BRINGING CONTRABAND INTO PENAL INSTITUTION',
+                                                            ifelse((str_detect(charge, 'BURGLARY') & str_detect(charge, '1ST|FIRST|1|I')), 'BURGLARY - FIRST DEGREE',
+                                                                   ifelse((str_detect(charge, 'BURGLARY') & str_detect(charge, 'OF')), 'BURGLARY',
+                                                                          ifelse((str_detect(charge, 'CAUSING') & str_detect(charge, 'ACCIDENT')), 'CAUSING AN ACCIDENT RESULTING IN GREAT BODILY HARM',
+                                                                                 ifelse(str_detect(charge, 'ENCOURAGING'), 'ENCOURAGING A MINOR TO COMMIT DRUG RELATED CRIME',
+                                                                                        ifelse(str_detect(charge, 'KIDNAPPING|CHILD STEALING'), 'KIDNAPPING',
+                                                                                               ifelse(str_detect(charge, 'CONCEALING|CONCELING|CONCELAING|RECEIVING STOLEN'), 'CONCEALING STOLEN PROPERTY',
+                                                                                                      charge))))))))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'CONSPIRACY') & str_detect(charge, 'COMMIT')), 'CONSPIRACY TO COMMIT A FELONY',
+                  ifelse((str_detect(charge, 'CONSPIRACY') & str_detect(charge, 'DELIVER|DISTRIBUTE|DISTRIBUTION')), 'CONSPIRACY TO DISTRIBUTE CONTROLLED DRUG SUBSTANCE',
+                         ifelse((str_detect(charge, 'CONSPIRACY|CONSPIRE') & str_detect(charge, 'TRAFFIC|TRAFFICK|TRAFFICKING')), 'CONSPIRACY TO TRAFFIC',
+                                ifelse((str_detect(charge, 'CONSPIRACY') & str_detect(charge, 'STEAL')), 'CONSPIRACY TO STEAL',
+                                       ifelse((str_detect(charge, 'CONSPIRACY') & str_detect(charge, 'POSSESS')), 'CONSPIRACY TO POSSESS CONTROLLED DRUG SUBSTANCE',
+                                              ifelse((str_detect(charge, 'CRUELTY') & str_detect(charge, 'ANIMALS')), 'CRUELTY TO ANIMALS',
+                                                     ifelse((str_detect(charge, 'DELIVERY') & str_detect(charge, 'CONTROLLED|CDS|MARIJUANA')), 'DELIVERY OF CONTROLLED DRUG SUBSTANCE',
+                                                            ifelse((str_detect(charge, 'DISCHARGE|DISCHARGING') & str_detect(charge, 'FIREARM')), 'DISCHARGE OF A FIREARM INTO A BUILDING',
+                                                                   ifelse((str_detect(charge, 'DISTRIBUTE|DISTRIBUTING|DISTRIBUTION') & str_detect(charge, 'CONTROLLED|CDS|MARIJUANA|COCAINE|METHAMPHETAMINE|CS')), 'DISTRIBUTION OF CONTROLLED DRUG SUBSTANCE',
+                                                                          charge))))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'CULTIVATE|CULTIVATING|CULTIVATION|MANUFACTURE|MANUFACTURING') & str_detect(charge, 'CONTROLLED|CDS|MARIJUANA')), 'MANUFACTURE OF CONTROLLED DRUG SUBSTANCE',
+                  ifelse(str_detect(charge, 'EMBEZZLEMENT'), 'EMBEZZLEMENT',
+                         ifelse(str_detect(charge, 'ENDEAVOR|ENDEAVORING'), 'ENDEAVORING TO COMMIT A FELONY',
+                                ifelse(str_detect(charge, 'ENTERING'), 'ENTERING WITH INTENT TO STEAL',
+                                       ifelse(str_detect(charge, 'ESCAPE|ESCAPING'), 'ESCAPE FROM PENAL INSTITUTION',
+                                              ifelse(str_detect(charge, 'EXPLOITATION'), 'EXPLOITATION OF ELDERLY PERSON',
+                                                     ifelse(str_detect(charge, 'FAILURE TO |FAILURE OF'), 'FAILURE TO COMPLY WITH TERMS OF SENTENCE',
+                                                            charge))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'TRAFFICKING') & str_detect(charge, 'DRUG|CDS|CONTROLLED')), 'DRUG TRAFFICKING',
+                  ifelse(str_detect(charge, 'FALSE DECLARATION|FALSE PAWN DECLARATION'), 'FALSE DECLARATION OF OWNERSHIP', charge)))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse(str_detect(charge, 'LARCENY |LARCENY-|LARCENY,'), 'LARCENY',
+                  ifelse(str_detect(charge, 'SODOMY'), 'FORCIBLE SODOMY',
+                         ifelse((str_detect(charge, 'FALSE|FALSELY') & str_detect(charge, 'PERSONATE|IMPERSONATION|PERSONATION')), 'FALSE PERSONATION',
+                                ifelse(str_detect(charge, 'CON GAME|CON GAME/'), 'BOGUS CHECK',
+                                       ifelse((str_detect(charge, 'FELONY|FELON|FELONIOUS|FELONIOUSLY') & str_detect(charge, 'FIREARM|WEAPON')), 'FELONIOUS POSSESSION OF FIREARM',
+                                              ifelse(str_detect(charge, 'FORGERY'), 'FORGERY',     
+                                                     ifelse(str_detect(charge, 'HARBORING'), 'HARBORING A FUGITIVE',
+                                                            ifelse((str_detect(charge, 'HOLDING|TAKING/RECEIVING') & str_detect(charge, 'CARD')), 'HOLDING STOLEN CREDIT CARD',
+                                                                   ifelse(str_detect(charge, 'FRAUD'), 'INSURANCE FRAUD',
+                                                                          ifelse((str_detect(charge, 'ILLEGAL POSSESSION') & str_detect(charge, 'FIREARM')), 'FELONIOUS POSSESSION OF FIREARM',
+                                                                                 ifelse(str_detect(charge, 'IMPERSONATING'), 'FALSE PERSONATION',
+                                                                                        ifelse(str_detect(charge, 'INDECENT|LEWD'), 'INDECENT OR LEWD ACTS WITH A CHILD',
+                                                                                               charge)))))))))))))
+
+docket <- docket %>%
+  mutate(charge =
+           ifelse(str_detect(charge, 'PUBLIC BUILDING'), 'INJURING A PUBLIC BUILDING',
+                  ifelse((str_detect(charge, 'INJURY') & str_detect(charge, 'CHILD')), 'CHILD ABUSE',
+                         ifelse((str_detect(charge, 'GRAND') & str_detect(charge, 'LARCENY')), 'GRAND LARCENY',
+                                ifelse(str_detect(charge, 'LEAVING'), 'LEAVING SCENE OF ACCIDENT',
+                                       ifelse(str_detect(charge, 'MAIMING'), 'MAIMING',
+                                              ifelse(str_detect(charge, 'MAINTAINING'), 'MAINTAINING DWELLING WHERE CONTROLLED DRUG SUBSTANCE IS KEPT/SOLD',
+                                                     ifelse((str_detect(charge, 'INJURY') & str_detect(charge, 'PROPERTY')), 'INJURY OF PROPERTY',
+                                                            ifelse((str_detect(charge, 'MURDER|MUDER') & str_detect(charge, 'FIRST|1ST|1|I')), 'MURDER - FIRST DEGREE',
+                                                                   ifelse((str_detect(charge, 'MURDER') & str_detect(charge, 'SECOND|2ND|2|II')), 'MURDER - SECOND DEGREE',
+                                                                          ifelse((str_detect(charge, 'MURDER') & str_detect(charge, '\\d*')), 'MURDER',
+                                                                                 charge)))))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'FALSE') & str_detect(charge, 'PRETENSE|PRETENSES')), 'OBTAINING BY FALSE PRETENSE',
+                  ifelse(str_detect(charge, 'TRICKERY|BOGUS CHECK|DECEPTION'), 'OBTAINING BY FALSE PRETENSE',
+                         ifelse((str_detect(charge, 'OMITTING') & str_detect(charge, 'CHILD')), 'CHILD NEGLECT',
+                                ifelse(str_detect(charge, 'PERJURY'), 'PERJURY',
+                                       ifelse(str_detect(charge, 'BODILY FLUIDS|BODY FLUID|BODILY FLUID'), 'PLACING BODILY FLUID ON GOVERNMENT EMPLOYEE',
+                                              ifelse(str_detect(charge, 'PLANNING|PLAN/|THREATEN|THREATENING'), 'PLANNING AN ACT OF VIOLENCE',
+                                                     ifelse((str_detect(charge, 'POINTING') & str_detect(charge, 'FIREARM|FIREARMS|FIREAM')), 'POINTING A FIREARM',
+                                                            ifelse((str_detect(charge, 'POSSESSION|POSSESS|POSSEESSION') & str_detect(charge, 'FIREARM|SHOTGUN|FIREAM')), 'FELONIOUS POSSESSION OF FIREARM',
+                                                                   ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'INTENT')), 'POSSESSION OF CONTROLLED DRUG SUBSTANCE WITH INTENT TO DISTRIBUTE',
+                                                                          ifelse((str_detect(charge, 'POSSESS|POSSESSION|POSSSESSION|POSESSION') & str_detect(charge, 'CDS|CONTROLLED|DRUG|COCAINE|MARIJUANA|METHAMPHETAMINE|PRECURSOR|CS')), 'POSSESSION OF CONTROLLED DRUG SUBSTANCE',
+                                                                                 charge)))))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'VEHICLE')), 'POSSESSION OF STOLEN VEHICLE',
+                  ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'CREDIT CARD|DEBIT CARD')), 'POSSESSION OF STOLEN CREDIT CARD',
+                         ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'CONTRABAND|INTOXICATING|WEAPON|CELL|CONTROLLED DANGEROUS SUBSTANCE IN PENAL INSTITUTION')), 'POSSESSION OF CONTRABAND',
+                                ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'COUNTERFEIT|FORGED')), 'POSSESSION OF COUNTERFEIT NOTE',
+                                       ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'COPPER')), 'POSSESSION OF STOLEN COPPER',
+                                              charge))))))
+
+docket <- docket %>%
+  mutate(charge =
+           ifelse((str_detect(charge, 'POSSESS|POSSESSION') & str_detect(charge, 'PROPERTY')), 'POSSESSION OF STOLEN PROPERTY',
+                  ifelse(str_detect(charge, 'RACKETEERING'), 'RACKETEERING', charge)))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse((str_detect(charge, 'FALSE') & str_detect(charge, 'DECLARATION')), 'FALSE DECLARATION OF OWNERSHIP',
+                  ifelse(str_detect(charge, 'ARSON'), 'ARSON',
+                         ifelse(str_detect(charge, 'ASSAULT ON'), 'ASSAULT',
+                                ifelse(str_detect(charge, 'ATTEMPTING TO INTIMIDATE'), 'ATTEMPTING TO PREVENT WITNESS FROM GIVING TESTIMONY',
+                                       ifelse(str_detect(charge, 'CONSPIRACY(?=$)'), 'CONSPIRACY TO COMMIT A FELONY',
+                                              ifelse(str_detect(charge, 'DELINQUENCY|GANG'), 'CONTRIBUTING TO THE DELINQUENCY OF MINORS',
+                                                     ifelse(str_detect(charge, 'DESTRUCTION OF STATE'), 'INJURING A PUBLIC BUILDING',
+                                                            ifelse(str_detect(charge, 'ABUSE BY'), 'CHILD ABUSE',
+                                                                   charge)))))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse(str_detect(charge, 'OBSCENE MATERIAL'), 'DISTRIBUTION OF OBSCENE MATERIAL',
+                  ifelse((str_detect(charge, 'FALSE') & str_detect(charge, 'CLAIM') & str_detect(charge, 'INSURANCE')), 'INSURANCE FRAUD',
+                         ifelse((str_detect(charge, 'FORFEITURE') & str_detect(charge, 'BAIL')), 'INCURRING FORFEITURE OF BAIL',
+                                ifelse(str_detect(charge, 'LARCENY OF'), 'LARCENY',
+                                       ifelse(str_detect(charge, 'MARIJUANA FELONY'), NA,
+                                              ifelse(str_detect(charge, 'PROTECTIVE ORDER'), 'PROTECTIVE ORDER VIOLATION',
+                                                     charge)))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse(str_detect(charge, 'RIOT|RIOTING'), 'RIOTING',
+                  ifelse(str_detect(charge, 'RACKETEERING'), 'RACKETEERING',
+                         ifelse(str_detect(charge, 'RAPE'), 'RAPE',
+                                ifelse((str_detect(charge, 'SEX OFFENDER') & str_detect(charge, 'LIVING|RESIDING')), 'SEX OFFENDER RESIDING WITHIN 2000 FT OF PARK OR SCHOOL',
+                                       ifelse((str_detect(charge, 'SEXUAL') & str_detect(charge, 'BATTERY')), 'SEXUAL BATTERY',
+                                              ifelse((str_detect(charge, 'SEXUALLY ABUSING') & str_detect(charge, 'CHILD')), 'SEXUALLY ABUSING A MINOR CHILD',
+                                                     ifelse((str_detect(charge, 'SHOOT|SHOOTING') & str_detect(charge, 'INTENT')), 'SHOOTING WITH INTENT TO INJURE OR KILL',
+                                                            ifelse(str_detect(charge, 'STALKING'), 'STALKING',
+                                                                   charge)))))))))
+
+docket <- docket %>%
+  mutate(charge =
+           ifelse(str_detect(charge, 'ANYDROUS AMMONIA|ANHYDROUS AMMONIA'), 'THEFT/TAMPER WITH ANYDROUS AMMONIA',
+                  ifelse(str_detect(charge, 'TRAFFICK|TRAFFICKING|TRANSPORTING|TRAFICKING'), 'TRAFFICKING',
+                         ifelse((str_detect(charge, 'UNAUTHORIZED|UNLAWFUL') & str_detect(charge, 'VEHICLE')), 'UNAUTHORIZED USE OF MOTOR VEHICLE',
+                                ifelse((str_detect(charge, 'UNAUTHORIZED|UNLAWFUL') & str_detect(charge, 'CARD')), 'UNAUTHORIZED USE OF CREDIT CARD',
+                                       ifelse((str_detect(charge, 'UNLAWFUL') & str_detect(charge, 'TECHNOLOGY')), 'UNLAWFUL COMMUNICATION BY TECHNOLOGY',
+                                              ifelse((str_detect(charge, 'UNLAWFUL') & str_detect(charge, 'DELIVERY|DISTRIBUTION')), 'UNLAWFUL DELIVERY OF CONTROLLED DRUG SUBSTANCE',
+                                                     charge)))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse(str_detect(charge, 'COMPUTER NETWORK'), 'UNLAWFUL COMMUNICATION BY TECHNOLOGY',
+                  ifelse((str_detect(charge, 'UTTERING') & str_detect(charge, 'INSTRUMENT|INSTRUMENTS')), 'UTTERING A FORGED INSTRUMENT',
+                         ifelse((str_detect(charge, 'VIOLATION') & str_detect(charge, 'CHILD')), 'CHILD CUSTODY COURT ORDER VIOLATION',
+                                ifelse((str_detect(charge, 'VIOLATION') & str_detect(charge, 'COMPUTER')), 'UNLAWFUL COMMUNICATION BY TECHNOLOGY',
+                                       ifelse((str_detect(charge, 'VIOLATION') & str_detect(charge, 'REGISTRATION|REGRISTRATION')), 'FAILURE TO COMPLY WITH TERMS OF SENTENCE',
+                                              charge))))))
+
+docket <- docket %>%
+  mutate(charge = 
+           ifelse(str_detect(charge, 'WEAPON USE'), 'WEAPON USE IN COMMISSION OF CRIME',
+                  ifelse(str_detect(charge, 'SURVEILLANCE'), 'TAMPERING WITH SURVEILLANCE CAMERA',
+                         ifelse(str_detect(charge, '^SAFETY ZONES AROUND'), NA,
+                                charge))))
+
+##casenum
+docket$casenum <- str_extract(docket$info, "(?<=CF: ).*?(?=None|\\d{2}/\\d{2}/\\d{4}|Denied|Waived|new line|Pass)") %>%
+  str_squish()
+
+##days_in_jail
+docket$days_in_jail <- str_extract(docket$info, "(?<=Next Board Consideration: new line).*?(?=days)") %>% 
+  str_squish() %>% 
+  as.numeric()
+
+##dates
+docket$dates <- str_extract(docket$info, "(?<=days).*?(?=,)") %>% str_squish()
+
+docket <- docket %>%
+  separate(dates, into = c("reception", "projected_release", "next_consideration"), sep = " ", remove = TRUE, convert = FALSE, fill = "right")
+
+docket$reception <- mdy(docket$reception)
+docket$projected_release <- mdy(docket$projected_release)
+docket$next_consideration <- mdy(docket$next_consideration)
+
+##sentence
+docket$sentence <- str_extract(docket$info, "(?<=Sentence: ).*?(?=new line)") %>%
+  str_squish() %>%
+  str_to_upper()
+
+##n_concurrent
+docket$concurrent_cases <- str_extract(docket$info, "(?<=Concurrent Cases: ).*?(?=Consecutive)") %>%
+  str_remove_all("new line") %>%
+  str_squish()
+
+docket <- docket %>%
+  separate(concurrent_cases, into = paste("concurrent_case", 1:30, sep = "_"), sep = " Count ", remove = TRUE, convert = FALSE, fill = "right")
+
+concurrent_cases <- docket %>%
+  select(doc_num, contains("concurrent"), month) %>%
+  gather(ctno, concurrent_cases, contains("concurrent")) %>%
+  select(-ctno) %>%
+  filter(!is.na(concurrent_cases))
+
+concurrent_cases <- concurrent_cases %>%
+  mutate(n = ifelse(str_detect(concurrent_cases, 'Not Applicable'), 0,
+                  ifelse(concurrent_cases == '', 0,
+                    ifelse(concurrent_cases == " ", 0,
+                  1))))
+
+n_concurrent <- concurrent_cases %>%
+  select(doc_num, n) %>%
+  group_by(doc_num) %>%
+  summarise_each(funs(sum))
+
+docket <- full_join(docket, n_concurrent, by=c("doc_num"))
+names(docket)[names(docket) == 'n'] <- 'n_concurrent'
+
+docket <- docket %>%
+  select(-contains("concurrent_case"))
+
+##n_consecutive
+docket$consecutive_cases <- str_extract(docket$info, "(?<=Consecutive Cases: ).*?(?=Detainer:)") %>%
+  str_remove_all("new line") %>%
+  str_squish()
+
+docket <- docket %>%
+  separate(consecutive_cases, into = paste("consecutive_case", 1:30, sep = "_"), sep = " Count ", remove = TRUE, convert = FALSE, fill = "right")
+
+consecutive_cases <- docket %>%
+  select(doc_num, contains("consecutive"), month) %>%
+  gather(ctno, consecutive_cases, contains("consecutive")) %>%
+  select(-ctno) %>%
+  filter(!is.na(consecutive_cases))
+
+consecutive_cases <- consecutive_cases %>%
+  mutate(n = ifelse(str_detect(consecutive_cases, 'Not Applicable'), 0,
+                    ifelse(consecutive_cases == '', 0,
+                           ifelse(consecutive_cases == " ", 0,
+                                  1))))
+
+n_consecutive <- consecutive_cases %>%
+  select(doc_num, n) %>%
+  group_by(doc_num) %>%
+  summarise_each(funs(sum))
+
+docket <- full_join(docket, n_consecutive, by=c("doc_num"))
+names(docket)[names(docket) == 'n'] <- 'n_consecutive'
+
+docket <- docket %>%
+  select(-contains("consecutive_case"))
+
+##detainer
+docket$detainer <- str_extract(docket$info, "(?<=Detainer:).*?(?=\\(\\d{1,3}\\))") %>%
+  str_remove('new line') %>%
+  str_remove('(?<=new line).*') %>%
+  str_remove_all('new line') %>%
+  str_squish()
+
+docket$detainer <- ifelse(str_detect(docket$detainer, "Not Applicable"), FALSE, TRUE)
+
+##outcome
+outcome <- str_extract(docket$info, "(?<=Consecutive Cases:).*?(?=$)") %>%
+  str_remove('.*(?=PAROLE|STRICKEN|COMMUTATION|PASS|PASSED|REBILLED|WAIVED|CONTINUED|DENIED|DISCHARGED|DUPLICATE|CONTINUED|DECEASED)') %>%
+  str_remove('\\(\\d{1,3}\\)')
+
+outcome <- trimws(gsub("\\b[a-z]+\\b", "", outcome)) %>% 
+  str_squish()
+
+docket$outcome <- outcome
+
+##program_type
+docket$program_type <- str_extract(docket$outcome, "(?<=WITH |COMPLETE).*?(?=$)") %>%
+  str_remove('\\(\\d{1,3}\\)') %>% 
+  str_squish()
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'DENIED|DENEID|DEINED'), 'DENIED', outcome))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'DECEASED'), 'DECEASED',
+                  ifelse(str_detect(outcome, 'DUPLICATE'), 'DUPLICATE',
+                         ifelse(str_detect(outcome, 'WAIVED'), 'WAIVED',
+                                ifelse(str_detect(outcome, 'STAGE II'), 'PASS TO STAGE II',
+                                       ifelse(str_detect(outcome, 'STRICKEN|STrICKEN'), 'STRICKEN',
+                                              ifelse(str_detect(outcome, 'DISCHARGED|DISHCARGED|DISHCARGED'), 'DISCHARGED', outcome)))))))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'CONSECUTIVE|CS'), 'PAROLE GRANTED TO CONSECUTIVE CASE',
+                  ifelse(str_detect(outcome, 'PAROLE GRANTED|COMPLETE|TREATMENT|COMMUNITY|TREAMENT|PAROLE WITH'), 'GRANTED', 
+                         ifelse(str_detect(outcome, 'PAROLE RECOMMENDED|PAROLE RECOMMENED'), 'PAROLE RECOMMENDED',
+                                ifelse(str_detect(outcome, 'DETAINER'), 'PAROLE TO DETAINER',
+                                       ifelse(str_detect(outcome, 'PASS TO \\d|PASSED TO \\d|PASS - \\d|PASS \\(\\d|PASS TO AUGUST|PASS TO MAY|PASS TO SEPTEMBER|PASSED|NEXT AVAILABLE'), 'PASSED', outcome))))))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'COMMUTATION RECOMMENDED'), 'COMMUTATION RECOMMENDED',
+                  ifelse(str_detect(outcome, 'CONTINUED'), 'CONTINUED',
+                         outcome)))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse((str_detect(outcome, 'MEDICAL') & str_detect(outcome, 'RECOMMEND|RECOMMENDED|RECOMMENED|RECOMMNED')), 'MEDICAL RECOMMENDED',
+                  ifelse((str_detect(outcome, 'RECOMMEND|RECOMMENDED|RECOMMENED') & str_detect(outcome, 'COMMUTE')), 'COMMUTATION RECOMMENDED',
+                         outcome)))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'REBILLED'), 'REBILLED TO NEW CASE',
+                  ifelse((str_detect(outcome, 'RECOMMEND|RECOMMENDED') & str_detect(outcome, 'IN ABSENTIA')), 'IN ABSENTIA RECOMMENDED',
+                         ifelse(str_detect(outcome, 'Type text here'), NA,
+                                outcome))))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'GOVERNOR'), 'PAROLE RECOMMENDED', outcome))
+
+##violent
+docket$violent <- grepl("MANSLAUGHTER|BATTERY|ARSON|ASSAULT|A&B|KIDNAPPING|MURDER|SHOOTING|ROBBERY|ABUSE|FLUID|RAPE|HIT AND|SODOMY|MOLEST|PORN|INTENT TO KILL|BURGLARY IN THE FIRST DEGREE|BURGLARY WITH EXPLOSIVES|MAIMING|CHILD ABUSE|LEWD|RIOT|TRAFFICKING|CHILD PROSTITUTION", docket$charge)
+
+docket$violent[which(docket$violent == FALSE & docket$outcome == 'PASSED TO STAGE II')] <- TRUE
+
+##DOC demographic data - Race, Gender, DOB
+Offender <- read.csv("~/Desktop/Oklahoma Policy Institute/Research Projects/DOC Data/Data from DOC/offender/Offender.csv")
+
+OffenderDemographics <- Offender %>%
+  select(DocNum, Race, Gender, DOB)
+
+names(OffenderDemographics)[names(OffenderDemographics) == 'DocNum'] <- 'doc_num'
+OffenderDemographics$doc_num <- as.character(OffenderDemographics$doc_num)
+
+docket <- full_join(docket, OffenderDemographics, by = "doc_num")
+
+docket <- docket %>%
+  filter(!is.na(outcome))
+
+docket$Race <- recode(docket$Race, "American Indian" = "I", Asian = "A", Black = "B", Hispanic = "H", Other = "O", "Pacific Islander" = "A", Unknown = "U", White = "W") %>%
+  as.factor()
+docket$Gender <- recode(docket$Gender, Female = "F", Male = "M") %>%
+  as.factor()
+docket$DOB <- docket$DOB %>%
+  str_remove("(?<=\\d{4}-\\d{2}-\\d{2}).*(?=$)") %>%
+  ymd()
+
+##sentence_in_years
+docket$sentence_in_years <- str_extract(docket$sentence, ".*?(?=YEARS)") %>% as.double()
+
+##results_of_last_consideration
+docket$results_of_last_consideration <- str_extract(docket$last_consideration, "(?<=, ).*") %>%
+  str_squish() %>%
+  str_to_upper()
+
+docket$last_consideration <- str_remove(docket$last_consideration, '(?<=,).*') %>%
+  str_remove_all(",") %>%
+  str_remove('None')
+
+docket$last_consideration <- mdy(docket$last_consideration) %>%
+  ymd()
+
+names(parole2)
+names(docket)
+
+## program type
+programs <- docket %>%
+  select(doc_num, month, program_type) %>%
+  gather(ctno, programs, program_type) %>%
+  select(-ctno) %>%
+  filter(!is.na(programs))
+
+programs <- programs %>%
+  separate(programs, into = paste0('program_', 1:8), sep = ",&|,|&| AND | WITH", remove = TRUE, convert = FALSE, fill = "right")
+
+fix_na <- function(x) {
+  ifelse(x == ""|x == ' ', NA, x)
+}
+
+programs$month <- as.character(programs$month)
+programs <- lapply(programs, fix_na)
+programs <- as.data.frame(programs)
+programs$n_programs <- apply(programs, 1, function(x) sum(!is.na(x[3:10])))
+programs$month <- ymd(programs$month)
+
+docket <- full_join(docket, programs, by = c('doc_num', 'month'))
+
+docket$program_1 <- NULL
+docket$program_2 <- NULL
+docket$program_3 <- NULL
+docket$program_4 <- NULL
+docket$program_5 <- NULL
+docket$program_6 <- NULL
+docket$program_7 <- NULL
+docket$program_8 <- NULL
+docket$program_type <- NULL
+
+names(docket)
+names(parole2)
+
+docket <- docket[c("info", "month", "name", "personal_appearance", "doc_num", "type", "county", "authority", "last_consideration", "charge", "casenum", "days_in_jail", "reception", "projected_release", "next_consideration", "sentence", "n_concurrent", "n_consecutive", "detainer", "outcome", "violent", "Race", "Gender", "DOB", "n_programs", "sentence_in_years", "results_of_last_consideration")]
+
+##checking for any problems
+##outcome
+outcomes <- count(parole$outcome)
+outcomes <- outcomes$x
+prob_outcome <- docket$outcome %!in% outcomes
+docket$outcome[prob_outcome] <- str_extract(docket$info[prob_outcome], '(?<=Concurrent Cases: ).*?(?=Consecutive Cases: )') %>%
+  str_remove_all('new line') %>%
+  str_remove('.*(?=PAROLE|STRICKEN|COMMUTATION|PASS|PASSED|REBILLED|WAIVED|CONTINUED|DENIED|DISCHARGED|DUPLICATE|CONTINUED|DECEASED)') %>%
+  str_remove('\\(\\d{1,3}\\)') %>%
+  str_squish()
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'DENIED|DENEID|DEINED'), 'DENIED', outcome))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'DECEASED'), 'DECEASED',
+                  ifelse(str_detect(outcome, 'DUPLICATE'), 'DUPLICATE',
+                         ifelse(str_detect(outcome, 'WAIVED'), 'WAIVED',
+                                ifelse(str_detect(outcome, 'STAGE II'), 'PASS TO STAGE II',
+                                       ifelse(str_detect(outcome, 'STRICKEN|STrICKEN'), 'STRICKEN',
+                                              ifelse(str_detect(outcome, 'DISCHARGED|DISHCARGED|DISHCARGED'), 'DISCHARGED', outcome)))))))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'CONSECUTIVE|CS'), 'PAROLE GRANTED TO CONSECUTIVE CASE',
+                  ifelse(str_detect(outcome, 'PAROLE GRANTED|COMPLETE|TREATMENT|COMMUNITY|TREAMENT|PAROLE WITH'), 'GRANTED', 
+                         ifelse(str_detect(outcome, 'PAROLE RECOMMENDED|PAROLE RECOMMENED'), 'PAROLE RECOMMENDED',
+                                ifelse(str_detect(outcome, 'DETAINER'), 'PAROLE TO DETAINER',
+                                       ifelse(str_detect(outcome, 'PASS TO \\d|PASSED TO \\d|PASS - \\d|PASS \\(\\d|PASS TO AUGUST|PASS TO MAY|PASS TO SEPTEMBER|PASSED|NEXT AVAILABLE'), 'PASSED', outcome))))))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'COMMUTATION RECOMMENDED'), 'COMMUTATION RECOMMENDED',
+                  ifelse(str_detect(outcome, 'CONTINUED'), 'CONTINUED',
+                         outcome)))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse((str_detect(outcome, 'MEDICAL') & str_detect(outcome, 'RECOMMEND|RECOMMENDED|RECOMMENED|RECOMMNED')), 'MEDICAL RECOMMENDED',
+                  ifelse((str_detect(outcome, 'RECOMMEND|RECOMMENDED|RECOMMENED') & str_detect(outcome, 'COMMUTE')), 'COMMUTATION RECOMMENDED',
+                         outcome)))
+
+docket <- docket %>%
+  mutate(outcome = 
+           ifelse(str_detect(outcome, 'REBILLED'), 'REBILLED TO NEW CASE',
+                  ifelse((str_detect(outcome, 'RECOMMEND|RECOMMENDED') & str_detect(outcome, 'IN ABSENTIA')), 'IN ABSENTIA RECOMMENDED',
+                         ifelse(str_detect(outcome, 'Type text here'), NA,
+                                outcome))))
+
+docket <- docket %>%
+  mutate(outcome =
+           ifelse(str_detect(outcome, 'GOVERNOR'), 'PAROLE RECOMMENDED', outcome))
+
+##charge
+charges <- count(parole$charge)
+charges <- charges$x
+prob_charge <- which(docket$charge %!in% parole$charge) ##find correct charge
+
+
+##type
+type <- levels(as.factor(parole$type))
+prob_type <- which(docket$type %!in% type)
+
+##county
+county <- levels(as.factor(parole$county))
+prob_county <- which(docket$county %!in% county)
+
+##casenum
+prob_casenum <- which(docket$casenum == ""|is.na(docket$casenum))
+
+##adding to existing csv
+names(parole)
+parole <- rbind(parole, docket)
+
+getwd()
+setwd()
+write.csv(parole, 'parole.csv')
+
+
